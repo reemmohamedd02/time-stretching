@@ -16,7 +16,7 @@ then
     echo -e "usage\t: $0 ['-d' | '--dev' | '-e' | '--eval']"
     echo -e "\tinvalid choice '$dev_eval'"
     echo -e "\tchoice from ['-d' | '--dev' | '-e' | '--eval']."
-    echo -e "\t\t-d, --dev\t: Using Development dataset. "
+    echo -e "\t\t-d, --dev\t: Using Develo`p`ment dataset. "
     echo -e "\t\t-e, --eval\t: Using Additional training dataset and Evaluation dataset. "
     echo -e "example\t: $ bash $0 -d"
     exit 1
@@ -32,15 +32,7 @@ then
 elif [ "${dev_eval}" = "-e" ] || [ "${dev_eval}" = "--eval" ]
 then
     dataset_list="\
-        DCASE2024T23DPrinter \
-        DCASE2024T2AirCompressor \
-        DCASE2024T2Scanner \
-        DCASE2024T2ToyCircuit \
-        DCASE2024T2HoveringDrone \
         DCASE2024T2HairDryer \
-        DCASE2024T2ToothBrush \
-        DCASE2024T2RoboticArm \
-        DCASE2024T2BrushlessMotor \
     "
 
 fi

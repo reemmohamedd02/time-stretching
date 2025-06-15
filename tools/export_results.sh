@@ -15,7 +15,7 @@ done
 for dir in $id_single_dirs
 do
 echo $dir
-python3 tools/concat_divided_roc.py \
+python tools/concat_divided_roc.py \
 --parent_dir ${dir} \
 --export_dir ${export_dir} \
 --dataset ${dataset} \
@@ -24,7 +24,7 @@ ${dev_eval} \
 done
 
 # summarize all results
-python3 tools/export_results.py "${export_dir}/" --dataset=${dataset} ${dev_eval}
+python tools/export_results.py "${export_dir}/" --dataset=${dataset} ${dev_eval}
 # extract the AUC mean
-python3 tools/extract_results.py "${export_dir}/" --dataset=${dataset} --float_format=${float_format} ${dev_eval}
+python tools/extract_results.py "${export_dir}/" --dataset=${dataset} --float_format=${float_format} ${dev_eval}
 echo "===================================================="

@@ -21,7 +21,7 @@ tag="${tag}${i}_"
 done
 tag="${tag})"
 
-python3 train.py \
+/d/Python312/python.exe train.py \
     --dataset=${dataset} \
     ${dev_eval} \
     -tag=${tag} \

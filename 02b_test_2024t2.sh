@@ -32,15 +32,8 @@ then
 elif [ "${dev_eval}" = "-e" ] || [ "${dev_eval}" = "--eval" ]
 then
     dataset_list="\
-        DCASE2024T23DPrinter \
-        DCASE2024T2AirCompressor \
-        DCASE2024T2Scanner \
-        DCASE2024T2ToyCircuit \
-        DCASE2024T2HoveringDrone \
         DCASE2024T2HairDryer \
-        DCASE2024T2ToothBrush \
-        DCASE2024T2RoboticArm \
-        DCASE2024T2BrushlessMotor \
+
     "
 fi
 
