@@ -1,21 +1,18 @@
 import torch
 from torch import nn
-import numpy as np
-from sklearn.neighbors import NearestNeighbors
 
+# First, define the AENet class
 class AENet(nn.Module):
-    def __init__(self, input_dim, block_size):
+    def __init__(self, input_dim, block_size, time_stretch_prob=0.5, time_stretch_range=(0.9, 1.1)):
         super(AENet, self).__init__()
         self.input_dim = input_dim
-        self.block_size = block_size
-        
-        # Parameters for storing covariance matrices
         self.cov_source = nn.Parameter(torch.zeros(block_size, block_size), requires_grad=False)
         self.cov_target = nn.Parameter(torch.zeros(block_size, block_size), requires_grad=False)
         
-        # Inverse covariance matrices (precision matrices)
-        self.register_buffer('inv_cov_source', torch.zeros(block_size, block_size))
-        self.register_buffer('inv_cov_target', torch.zeros(block_size, block_size))
+        # Time stretch augmentation parameters
+        self.time_stretch_prob = time_stretch_prob
+        self.time_stretch_range = time_stretch_range
+        self.training_mode = True
 
         self.encoder = nn.Sequential(
             nn.Linear(self.input_dim, 128),
@@ -30,13 +27,13 @@ class AENet(nn.Module):
             nn.Linear(128, 128),
             nn.BatchNorm1d(128, momentum=0.01, eps=1e-03),
             nn.ReLU(),
-            nn.Linear(128, block_size),
-            nn.BatchNorm1d(block_size, momentum=0.01, eps=1e-03),
+            nn.Linear(128, 8),
+            nn.BatchNorm1d(8, momentum=0.01, eps=1e-03),
             nn.ReLU(),
         )
 
         self.decoder = nn.Sequential(
-            nn.Linear(block_size, 128),
+            nn.Linear(8, 128),
             nn.BatchNorm1d(128, momentum=0.01, eps=1e-03),
             nn.ReLU(),
             nn.Linear(128, 128),
@@ -50,331 +47,207 @@ class AENet(nn.Module):
             nn.ReLU(),
             nn.Linear(128, self.input_dim)
         )
-
-    def forward(self, x):
-        z = self.encoder(x.view(-1, self.input_dim))
-        return self.decoder(z), z
-    
-    def compute_covariance_matrices(self, source_data, target_data, eps=1e-6):
-        """
-        Compute covariance matrices for source and target domains
         
-        Parameters:
-        -----------
-        source_data : torch.Tensor
-            Data from source domain
-        target_data : torch.Tensor
-            Data from target domain
-        eps : float
-            Small value to ensure numerical stability
-        """
-        # Get reconstructions and latent representations
-        with torch.no_grad():
-            source_recon, source_z = self(source_data)
-            target_recon, target_z = self(target_data)
-            
-            # Compute reconstruction errors
-            source_diff = source_recon - source_data
-            target_diff = target_recon - target_data
-            
-            # Reshape to 2D if needed
-            if len(source_diff.shape) > 2:
-                source_diff = source_diff.view(source_diff.size(0), -1)
-                target_diff = target_diff.view(target_diff.size(0), -1)
-            
-            # Compute covariance matrices
-            source_diff = source_diff - source_diff.mean(dim=0, keepdim=True)
-            target_diff = target_diff - target_diff.mean(dim=0, keepdim=True)
-            
-            # Compute covariance matrices
-            self.cov_source.data = (source_diff.T @ source_diff) / (source_diff.size(0) - 1)
-            self.cov_target.data = (target_diff.T @ target_diff) / (target_diff.size(0) - 1)
-            
-            # Add small value to diagonal for numerical stability
-            self.cov_source.data += torch.eye(self.cov_source.size(0), device=self.cov_source.device) * eps
-            self.cov_target.data += torch.eye(self.cov_target.size(0), device=self.cov_target.device) * eps
-            
-            # Compute inverse covariance matrices
-            self.inv_cov_source = torch.inverse(self.cov_source.data)
-            self.inv_cov_target = torch.inverse(self.cov_target.data)
+        # Initialize covariance matrices for Mahalanobis distance
+        self.register_buffer('mean_source', torch.zeros(block_size))
+        self.register_buffer('mean_target', torch.zeros(block_size))
+        self.register_buffer('inv_cov_source', torch.eye(block_size))
+        self.register_buffer('inv_cov_target', torch.eye(block_size))
     
-    def mahalanobis_distance(self, x, recon, inv_cov):
+    def forward(self, x, apply_augmentation=True):
         """
-        Compute Mahalanobis distance between original and reconstructed samples
+        Forward pass with optional time stretch augmentation.
         
-        Parameters:
-        -----------
-        x : torch.Tensor
-            Original samples
-        recon : torch.Tensor
-            Reconstructed samples
-        inv_cov : torch.Tensor
-            Inverse covariance matrix
+        Args:
+            x (torch.Tensor): Input data
+            apply_augmentation (bool): Whether to apply augmentation
+        
+        Returns:
+            tuple: (reconstructed_x, latent_z)
+        """
+        x_flat = x.view(-1, self.input_dim)
+        
+        # Apply time stretch augmentation during training if requested
+        if self.training and apply_augmentation and torch.rand(1).item() < self.time_stretch_prob:
+            x_aug = self.apply_time_stretch(x_flat)
+            z = self.encoder(x_aug)
+        else:
+            z = self.encoder(x_flat)
+            
+        reconstructed = self.decoder(z)
+        return reconstructed, z
+    
+    def apply_time_stretch(self, x):
+        """
+        Apply time stretching to feature vectors.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape [batch_size, feature_dim]
             
         Returns:
-        --------
-        torch.Tensor
-            Mahalanobis distances
+            torch.Tensor: Time-stretched features
         """
-        diff = recon - x
-        if len(diff.shape) > 2:
-            diff = diff.view(diff.size(0), -1)
+        import torch.nn.functional as F
+        import numpy as np
         
-        # Compute Mahalanobis distance
-        dist = torch.sum((diff @ inv_cov) * diff, dim=1)
-        return dist
-    
-    def compute_anomaly_score(self, x, mode='mse'):
-        """
-        Compute anomaly score for input samples
+        batch_size = x.size(0)
+        feature_dim = x.size(1)
         
-        Parameters:
-        -----------
-        x : torch.Tensor
-            Input samples
-        mode : str
-            'mse': Mean Squared Error (Simple Autoencoder mode)
-            'mahalanobis': Mahalanobis distance using source domain covariance
-            'selective_mahalanobis': Minimum of source and target Mahalanobis distances
-            
-        Returns:
-        --------
-        torch.Tensor
-            Anomaly scores
-        """
-        with torch.no_grad():
-            recon, z = self(x)
-            
-            if mode == 'mse':
-                # Simple Autoencoder mode
-                diff = recon - x
-                if len(diff.shape) > 2:
-                    diff = diff.view(diff.size(0), -1)
-                scores = torch.sum(diff ** 2, dim=1)
+        # Process each sample in the batch
+        augmented_batch = []
+        
+        for i in range(batch_size):
+            # Apply augmentation with probability
+            if torch.rand(1).item() < self.time_stretch_prob:
+                # Choose a stretch factor
+                stretch_factor = torch.FloatTensor(1).uniform_(*self.time_stretch_range).item()
                 
-            elif mode == 'mahalanobis':
-                # Mahalanobis distance using source domain covariance
-                scores = self.mahalanobis_distance(x, recon, self.inv_cov_source)
+                # Divide the feature vector into segments (assuming time is somehow represented)
+                num_segments = 8  # Arbitrary division, adjust based on your data
+                segment_length = feature_dim // num_segments
                 
-            elif mode == 'selective_mahalanobis':
-                # Selective Mahalanobis mode - minimum of source and target distances
-                source_dist = self.mahalanobis_distance(x, recon, self.inv_cov_source)
-                target_dist = self.mahalanobis_distance(x, recon, self.inv_cov_target)
-                scores = torch.min(source_dist, target_dist)
+                # Process each segment
+                stretched_segments = []
+                for j in range(num_segments):
+                    start_idx = j * segment_length
+                    end_idx = start_idx + segment_length if j < num_segments - 1 else feature_dim
+                    
+                    segment = x[i, start_idx:end_idx]
+                    
+                    # Stretch the segment
+                    new_length = int(segment.size(0) * stretch_factor)
+                    new_length = max(1, new_length)  # Ensure at least one element
+                    
+                    # Use interpolation
+                    stretched = F.interpolate(
+                        segment.unsqueeze(0).unsqueeze(0),  # [1, 1, segment_length]
+                        size=new_length,
+                        mode='linear',
+                        align_corners=False
+                    ).squeeze(0).squeeze(0)  # [new_length]
+                    
+                    # Resize back to original length
+                    resized = F.interpolate(
+                        stretched.unsqueeze(0).unsqueeze(0),  # [1, 1, new_length]
+                        size=end_idx - start_idx,
+                        mode='linear',
+                        align_corners=False
+                    ).squeeze(0).squeeze(0)  # [segment_length]
+                    
+                    stretched_segments.append(resized)
                 
+                # Combine segments
+                augmented_sample = torch.cat(stretched_segments)
+                augmented_batch.append(augmented_sample)
             else:
-                raise ValueError(f"Unknown mode: {mode}")
+                augmented_batch.append(x[i])
+        
+        return torch.stack(augmented_batch)
+    
+    def train(self, mode=True):
+        """Override train method to set training_mode flag"""
+        self.training_mode = mode
+        return super().train(mode)
+    
+    def eval(self):
+        """Override eval method to set training_mode flag"""
+        self.training_mode = False
+        return super().eval()
+    
+    def compute_mahalanobis_distance(self, z, is_source=True):
+        """
+        Compute Mahalanobis distance for latent vectors.
+        
+        Args:
+            z (torch.Tensor): Latent vectors
+            is_source (bool): Whether to use source or target distribution
+        
+        Returns:
+            torch.Tensor: Mahalanobis distances
+        """
+        if is_source:
+            mean = self.mean_source
+            inv_cov = self.inv_cov_source
+        else:
+            mean = self.mean_target
+            inv_cov = self.inv_cov_target
+            
+        # Center the data
+        centered = z - mean.unsqueeze(0)
+        
+        # Compute Mahalanobis distance: sqrt((x-μ)ᵀΣ⁻¹(x-μ))
+        distances = torch.sqrt(torch.sum(
+            torch.matmul(centered, inv_cov) * centered, dim=1
+        ))
+        
+        return distances
+    
+    def update_covariance(self, embeddings, is_source=True):
+        """
+        Update covariance matrix for source or target domain.
+        
+        Args:
+            embeddings (torch.Tensor): Latent embeddings
+            is_source (bool): Whether to update source or target distribution
+        """
+        # Compute mean
+        mean = embeddings.mean(dim=0)
+        
+        # Center the data
+        centered = embeddings - mean.unsqueeze(0)
+        
+        # Compute covariance matrix
+        n_samples = embeddings.size(0)
+        cov = torch.matmul(centered.t(), centered) / (n_samples - 1)
+        
+        # Add small regularization for numerical stability
+        cov = cov + torch.eye(cov.size(0), device=cov.device) * 1e-5
+        
+        # Compute inverse
+        try:
+            inv_cov = torch.inverse(cov)
+        except:
+            # Fallback to pseudo-inverse if inverse fails
+            inv_cov = torch.pinverse(cov)
+        
+        # Update parameters
+        if is_source:
+            self.mean_source.copy_(mean.detach())
+            self.cov_source.copy_(cov.detach())
+            self.inv_cov_source.copy_(inv_cov.detach())
+        else:
+            self.mean_target.copy_(mean.detach())
+            self.cov_target.copy_(cov.detach())
+            self.inv_cov_target.copy_(inv_cov.detach())
+    
+    def compute_anomaly_score(self, x, use_mahalanobis=True):
+        """
+        Compute anomaly score for input samples.
+        
+        Args:
+            x (torch.Tensor): Input samples
+            use_mahalanobis (bool): Whether to use Mahalanobis distance
+        
+        Returns:
+            torch.Tensor: Anomaly scores
+        """
+        self.eval()  # Set to evaluation mode
+        with torch.no_grad():
+            # Get reconstruction and latent representation
+            x_flat = x.view(-1, self.input_dim)
+            reconstructed, z = self.forward(x_flat, apply_augmentation=False)
+            
+            if use_mahalanobis:
+                # Compute Mahalanobis distance in latent space
+                anomaly_scores = self.compute_mahalanobis_distance(z, is_source=False)
+            else:
+                # Use reconstruction error as anomaly score
+                reconstruction_error = torch.mean((reconstructed - x_flat) ** 2, dim=1)
+                anomaly_scores = reconstruction_error
                 
-            return scores
+        return anomaly_scores
 
+# Then, if you need to create an instance, do it after the class definition
+# For example:
+# model = AENet(input_dim=640, block_size=8)
 
-class SMOTE:
-    """
-    Implementation of SMOTE (Synthetic Minority Over-sampling Technique) for PyTorch tensors.
-    
-    Parameters:
-    -----------
-    k : int, optional (default=5)
-        Number of nearest neighbors to use for generating synthetic samples.
-    n_samples : int or float, optional (default=1.0)
-        If int, specifies the exact number of synthetic samples to generate.
-        If float, specifies the ratio of synthetic samples to generate relative to the original minority class.
-    random_state : int, optional (default=None)
-        Random seed for reproducibility.
-    distance_metric : str, optional (default='euclidean')
-        Distance metric to use for finding nearest neighbors.
-        Options: 'euclidean', 'mahalanobis'
-    """
-    
-    def __init__(self, k=5, n_samples=1.0, random_state=None, distance_metric='euclidean'):
-        self.k = k
-        self.n_samples = n_samples
-        self.random_state = random_state
-        self.distance_metric = distance_metric
-        self.inv_cov = None  # For Mahalanobis distance
-        
-        if random_state is not None:
-            torch.manual_seed(random_state)
-            np.random.seed(random_state)
-    
-    def fit_resample(self, X, y, inv_cov=None):
-        """
-        Generate synthetic samples for the minority class.
-        
-        Parameters:
-        -----------
-        X : torch.Tensor
-            Feature tensor of shape (n_samples, n_features)
-        y : torch.Tensor
-            Target tensor of shape (n_samples,)
-        inv_cov : torch.Tensor, optional
-            Inverse covariance matrix for Mahalanobis distance
-            
-        Returns:
-        --------
-        X_resampled : torch.Tensor
-            Resampled feature tensor with synthetic samples
-        y_resampled : torch.Tensor
-            Corresponding target tensor with synthetic samples
-        """
-        # Set inverse covariance matrix if provided
-        if inv_cov is not None:
-            self.inv_cov = inv_cov
-        
-        # Convert tensors to numpy for easier processing
-        X_np = X.detach().cpu().numpy()
-        y_np = y.detach().cpu().numpy()
-        
-        # Find minority class
-        unique_classes, class_counts = np.unique(y_np, return_counts=True)
-        minority_class = unique_classes[np.argmin(class_counts)]
-        
-        # Get minority class samples
-        minority_indices = np.where(y_np == minority_class)[0]
-        minority_samples = X_np[minority_indices]
-        
-        # Determine number of synthetic samples to generate
-        if isinstance(self.n_samples, float):
-            n_synthetic = int(self.n_samples * len(minority_samples))
-        else:
-            n_synthetic = self.n_samples
-        
-        # Find k nearest neighbors for each minority sample
-        if self.distance_metric == 'euclidean':
-            nn = NearestNeighbors(n_neighbors=self.k + 1)  # +1 because the sample itself is included
-            nn.fit(minority_samples)
-            distances, indices = nn.kneighbors(minority_samples)
-        elif self.distance_metric == 'mahalanobis':
-            if self.inv_cov is None:
-                raise ValueError("Inverse covariance matrix must be provided for Mahalanobis distance")
-            
-            # Convert inverse covariance to numpy
-            inv_cov_np = self.inv_cov.detach().cpu().numpy()
-            
-            # Compute pairwise Mahalanobis distances
-            n_samples = minority_samples.shape[0]
-            distances = np.zeros((n_samples, n_samples))
-            for i in range(n_samples):
-                for j in range(n_samples):
-                    diff = minority_samples[i] - minority_samples[j]
-                    distances[i, j] = np.sqrt(diff @ inv_cov_np @ diff.T)
-            
-            # Get indices of k+1 nearest neighbors
-            indices = np.argsort(distances, axis=1)[:, :self.k+1]
-        else:
-            raise ValueError(f"Unknown distance metric: {self.distance_metric}")
-        
-        # Generate synthetic samples
-        synthetic_samples = []
-        for i in range(n_synthetic):
-            # Randomly select a minority sample
-            sample_idx = np.random.randint(0, len(minority_samples))
-            sample = minority_samples[sample_idx]
-            
-            # Randomly select one of its neighbors (excluding itself)
-            neighbor_idx = indices[sample_idx][np.random.randint(1, self.k + 1)]
-            neighbor = minority_samples[neighbor_idx]
-            
-            # Generate synthetic sample by interpolation
-            alpha = np.random.random()
-            synthetic_sample = sample + alpha * (neighbor - sample)
-            synthetic_samples.append(synthetic_sample)
-        
-        # Combine original and synthetic samples
-        X_resampled_np = np.vstack([X_np, synthetic_samples])
-        y_resampled_np = np.hstack([y_np, np.full(len(synthetic_samples), minority_class)])
-        
-        # Convert back to PyTorch tensors
-        X_resampled = torch.tensor(X_resampled_np, dtype=X.dtype, device=X.device)
-        y_resampled = torch.tensor(y_resampled_np, dtype=y.dtype, device=y.device)
-        
-        return X_resampled, y_resampled
-    
-    def fit_resample_latent(self, model, X, y, mode='selective_mahalanobis'):
-        """
-        Generate synthetic samples in the latent space of an autoencoder.
-        
-        Parameters:
-        -----------
-        model : AENet
-            Trained autoencoder model
-        X : torch.Tensor
-            Feature tensor of shape (n_samples, n_features)
-        y : torch.Tensor
-            Target tensor of shape (n_samples,)
-        mode : str
-            'euclidean': Use Euclidean distance for SMOTE
-            'mahalanobis': Use Mahalanobis distance with source covariance
-            'selective_mahalanobis': Use minimum of source and target Mahalanobis distances
-            
-        Returns:
-        --------
-        X_resampled : torch.Tensor
-            Resampled feature tensor with synthetic samples
-        y_resampled : torch.Tensor
-            Corresponding target tensor with synthetic samples
-        """
-        # Get latent representations
-        model.eval()
-        with torch.no_grad():
-            _, latent = model(X)
-        
-        # Set distance metric and inverse covariance matrix based on mode
-        if mode == 'euclidean':
-            self.distance_metric = 'euclidean'
-            inv_cov = None
-        elif mode == 'mahalanobis':
-            self.distance_metric = 'mahalanobis'
-            inv_cov = model.inv_cov_source
-        elif mode == 'selective_mahalanobis':
-            # For selective Mahalanobis, we'll use source covariance for neighbor finding
-            # but will compute both distances when calculating anomaly scores
-            self.distance_metric = 'mahalanobis'
-            inv_cov = model.inv_cov_source
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-        
-        # Apply SMOTE in the latent space
-        latent_resampled, y_resampled = self.fit_resample(latent, y, inv_cov)
-        
-        # Decode the synthetic samples
-        with torch.no_grad():
-            synthetic_indices = range(len(y), len(y_resampled))
-            synthetic_latent = latent_resampled[synthetic_indices]
-            synthetic_X = model.decoder(synthetic_latent)
-        
-        # Combine original and synthetic samples
-        X_resampled = torch.cat([X, synthetic_X], dim=0)
-        
-        return X_resampled, y_resampled
-
-
-# Example usage:
-"""
-# Initialize the model
-input_dim = 128
-block_size = 8  # This should match the latent dimension in the encoder
-model = AENet(input_dim, block_size)
-
-# Create some dummy data
-X = torch.randn(100, input_dim)
-y = torch.cat([torch.zeros(80), torch.ones(20)])  # Imbalanced dataset
-
-# Split into source and target domains
-source_indices = torch.where(y == 0)[0][:70]  # 70 samples from class 0
-target_indices = torch.cat([torch.where(y == 0)[0][70:], torch.where(y == 1)[0]])  # 10 samples from class 0, 20 from class 1
-X_source = X[source_indices]
-X_target = X[target_indices]
-
-# Compute covariance matrices for Mahalanobis distance
-model.compute_covariance_matrices(X_source, X_target)
-
-# Initialize SMOTE with Mahalanobis distance
-smote = SMOTE(k=5, n_samples=60, distance_metric='mahalanobis')
-
-# Apply SMOTE in the latent space with selective Mahalanobis mode
-X_resampled, y_resampled = smote.fit_resample_latent(model, X, y, mode='selective_mahalanobis')
-
-# Compute anomaly scores using selective Mahalanobis mode
-anomaly_scores = model.compute_anomaly_score(X, mode='selective_mahalanobis')
-"""
